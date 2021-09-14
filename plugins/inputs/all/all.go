@@ -166,6 +166,7 @@ import (
 	_ "github.com/influxdata/telegraf/plugins/inputs/sflow"
 	_ "github.com/influxdata/telegraf/plugins/inputs/smart"
 	_ "github.com/influxdata/telegraf/plugins/inputs/snmp"
+	_ "github.com/influxdata/telegraf/plugins/inputs/snmp_heartbeat"
 	_ "github.com/influxdata/telegraf/plugins/inputs/snmp_legacy"
 	_ "github.com/influxdata/telegraf/plugins/inputs/snmp_trap"
 	_ "github.com/influxdata/telegraf/plugins/inputs/socket_listener"

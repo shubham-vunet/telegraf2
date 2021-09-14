@@ -1,35 +1,39 @@
 package snmp_trap
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
+	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/internal"
 	"github.com/influxdata/telegraf/plugins/inputs"
-	"github.com/sleepinggenius2/gosmi"
-	"github.com/sleepinggenius2/gosmi/types"
 
 	"github.com/gosnmp/gosnmp"
 )
 
 var defaultTimeout = config.Duration(time.Second * 5)
 
+type execer func(config.Duration, string, ...string) ([]byte, error)
+
 type mibEntry struct {
 	mibName string
 	oidText string
+	enumMap map[int]string
 }
 
 type SnmpTrap struct {
 	ServiceAddress string          `toml:"service_address"`
 	Timeout        config.Duration `toml:"timeout"`
 	Version        string          `toml:"version"`
-	Path           []string        `toml:"path"`
 
 	// Settings for version 3
 	// Values: "noAuthNoPriv", "authNoPriv", "authPriv"
@@ -42,15 +46,19 @@ type SnmpTrap struct {
 	PrivProtocol string `toml:"priv_protocol"`
 	PrivPassword string `toml:"priv_password"`
 
-	acc        telegraf.Accumulator
-	listener   *gosnmp.TrapListener
-	timeFunc   func() time.Time
-	lookupFunc func(string) (mibEntry, error)
-	errCh      chan error
+	acc      telegraf.Accumulator
+	listener *gosnmp.TrapListener
+	timeFunc func() time.Time
+	errCh    chan error
 
 	makeHandlerWrapper func(gosnmp.TrapHandlerFunc) gosnmp.TrapHandlerFunc
 
 	Log telegraf.Logger `toml:"-"`
+
+	cacheLock sync.Mutex
+	cache     map[string]mibEntry
+
+	execCmd execer
 }
 
 var sampleConfig = `
@@ -62,10 +70,6 @@ var sampleConfig = `
   ## 1024.  See README.md for details
   ##
   # service_address = "udp://:162"
-  ##
-  ## Path to mib files
-  # path = ["/usr/share/snmp/mibs"]
-  ##
   ## Timeout running snmptranslate command
   # timeout = "5s"
   ## Snmp version, defaults to 2c
@@ -102,7 +106,6 @@ func init() {
 	inputs.Add("snmp_trap", func() telegraf.Input {
 		return &SnmpTrap{
 			timeFunc:       time.Now,
-			lookupFunc:     lookup,
 			ServiceAddress: "udp://:162",
 			Timeout:        defaultTimeout,
 			Version:        "2c",
@@ -110,50 +113,20 @@ func init() {
 	})
 }
 
-func (s *SnmpTrap) Init() error {
-	// must init, append path for each directory, load module for every file
-	// or gosmi will fail without saying why
-	gosmi.Init()
-	err := s.getMibsPath()
+func realExecCmd(timeout config.Duration, arg0 string, args ...string) ([]byte, error) {
+	cmd := exec.Command(arg0, args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := internal.RunTimeout(cmd, time.Duration(timeout))
 	if err != nil {
-		s.Log.Errorf("Could not get path %v", err)
+		return nil, err
 	}
-	return nil
+	return out.Bytes(), nil
 }
 
-func (s *SnmpTrap) getMibsPath() error {
-	var folders []string
-	for _, mibPath := range s.Path {
-		gosmi.AppendPath(mibPath)
-		folders = append(folders, mibPath)
-		err := filepath.Walk(mibPath, func(path string, info os.FileInfo, err error) error {
-			if info.Mode()&os.ModeSymlink != 0 {
-				s, _ := os.Readlink(path)
-				folders = append(folders, s)
-			}
-			return nil
-		})
-		if err != nil {
-			s.Log.Errorf("Filepath could not be walked %v", err)
-		}
-		for _, folder := range folders {
-			err := filepath.Walk(folder, func(path string, info os.FileInfo, err error) error {
-				if info.IsDir() {
-					gosmi.AppendPath(path)
-				} else if info.Mode()&os.ModeSymlink == 0 {
-					_, err := gosmi.LoadModule(info.Name())
-					if err != nil {
-						s.Log.Errorf("Module could not be loaded %v", err)
-					}
-				}
-				return nil
-			})
-			if err != nil {
-				s.Log.Errorf("Filepath could not be walked %v", err)
-			}
-		}
-		folders = []string{}
-	}
+func (s *SnmpTrap) Init() error {
+	s.cache = map[string]mibEntry{}
+	s.execCmd = realExecCmd
 	return nil
 }
 
@@ -277,7 +250,6 @@ func (s *SnmpTrap) Start(acc telegraf.Accumulator) error {
 
 func (s *SnmpTrap) Stop() {
 	s.listener.Close()
-	defer gosmi.Exit()
 	err := <-s.errCh
 	if nil != err {
 		s.Log.Errorf("Error stopping trap listener %v", err)
@@ -298,7 +270,6 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 
 		tags["version"] = packet.Version.String()
 		tags["source"] = addr.IP.String()
-
 		if packet.Version == gosnmp.Version1 {
 			// Follow the procedure described in RFC 2576 3.1 to
 			// translate a v1 trap to v2.
@@ -311,7 +282,7 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 			}
 
 			if trapOid != "" {
-				e, err := s.lookupFunc(trapOid)
+				e, err := s.lookup(trapOid)
 				if err != nil {
 					s.Log.Errorf("Error resolving V1 OID, oid=%s, source=%s: %v", trapOid, tags["source"], err)
 					return
@@ -339,6 +310,14 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 			// only handles textual convention for ip and mac
 			// addresses
 
+			e, err := s.lookup(v.Name)
+			if nil != err {
+				s.Log.Errorf("Error resolving OID oid=%s, source=%s: %v", v.Name, tags["source"], err)
+				return
+			}
+
+			name := e.oidText
+
 			switch v.Type {
 			case gosnmp.ObjectIdentifier:
 				val, ok := v.Value.(string)
@@ -349,7 +328,7 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 
 				var e mibEntry
 				var err error
-				e, err = s.lookupFunc(val)
+				e, err = s.lookup(val)
 				if nil != err {
 					s.Log.Errorf("Error resolving value OID, oid=%s, source=%s: %v", val, tags["source"], err)
 					return
@@ -363,17 +342,15 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 					setTrapOid(tags, val, e)
 					continue
 				}
+
+			case gosnmp.Integer:
+				if val, ok := e.enumMap[v.Value.(int)]; ok {
+					value = val
+				}
+
 			default:
 				value = v.Value
 			}
-
-			e, err := s.lookupFunc(v.Name)
-			if nil != err {
-				s.Log.Errorf("Error resolving OID oid=%s, source=%s: %v", v.Name, tags["source"], err)
-				return
-			}
-
-			name := e.oidText
 
 			fields[name] = value
 		}
@@ -396,16 +373,50 @@ func makeTrapHandler(s *SnmpTrap) gosnmp.TrapHandlerFunc {
 	}
 }
 
-func lookup(oid string) (e mibEntry, err error) {
-	var node gosmi.SmiNode
-	node, err = gosmi.GetNodeByOID(types.OidMustFromString(oid))
+func (s *SnmpTrap) lookup(oid string) (e mibEntry, err error) {
+	s.cacheLock.Lock()
+	defer s.cacheLock.Unlock()
+	var ok bool
+	if e, ok = s.cache[oid]; !ok {
+		// cache miss.  exec snmptranslate
+		e, err = s.snmptranslate(oid)
+		if err == nil {
+			s.cache[oid] = e
+		}
+		return e, err
+	}
+	return e, nil
+}
 
-	// ensure modules are loaded or node will be empty (might not error)
+func (s *SnmpTrap) clear() {
+	s.cacheLock.Lock()
+	defer s.cacheLock.Unlock()
+	s.cache = map[string]mibEntry{}
+}
+
+func (s *SnmpTrap) load(oid string, e mibEntry) {
+	s.cacheLock.Lock()
+	defer s.cacheLock.Unlock()
+	s.cache[oid] = e
+}
+
+func (s *SnmpTrap) snmptranslate(oid string) (e mibEntry, err error) {
+	var out []byte
+	out, err = s.execCmd(s.Timeout, "snmptranslate", "-Td", "-Ob", "-m", "all", oid)
+
 	if err != nil {
 		return e, err
 	}
 
-	e.oidText = node.RenderQualified()
+	scanner := bufio.NewScanner(bytes.NewBuffer(out))
+
+	// This reads first line
+	ok := scanner.Scan()
+	if err = scanner.Err(); !ok && err != nil {
+		return e, err
+	}
+
+	e.oidText = scanner.Text()
 
 	i := strings.Index(e.oidText, "::")
 	if i == -1 {
@@ -413,5 +424,35 @@ func lookup(oid string) (e mibEntry, err error) {
 	}
 	e.mibName = e.oidText[:i]
 	e.oidText = e.oidText[i+2:]
+
+	// read other lines here
+	e.enumMap = make(map[int]string)
+	syntaxRE := regexp.MustCompile(`\{(.*?)\}`)
+	enumComponentRE := regexp.MustCompile(`\((.*?)\)`)
+	for scanner.Scan() {
+		if err = scanner.Err(); err != nil {
+			return e, err
+		}
+		trapLine := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(trapLine, "SYNTAX") {
+			enumStringMatches := syntaxRE.FindStringSubmatch(trapLine)
+			if len(enumStringMatches) > 0 {
+				enumString := strings.TrimLeft(enumStringMatches[0], "{")
+				enumStringTrimmed := strings.TrimRight(enumString, "}")
+				enumStringList := strings.Split(enumStringTrimmed, ",")
+				for _, s := range enumStringList {
+					enumComponentString := strings.TrimSpace(s)
+					enumComponent := enumComponentRE.FindStringSubmatch(enumComponentString)
+					intVal, err := strconv.Atoi(enumComponent[1])
+					if err != nil {
+						// handle error
+						return e, err
+					}
+					e.enumMap[intVal] = enumComponentString
+				}
+				break
+			}
+		}
+	}
 	return e, nil
 }
