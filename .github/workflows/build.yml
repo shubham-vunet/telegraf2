@@ -14,14 +14,7 @@ jobs:
   prebuild:
     name: Build Telegraf
     runs-on: ubuntu-latest
-    # if: github.repository_owner == 'vunetsystems'
+    if: github.repository_owner == 'vunetsystems'
     steps:
       - uses: actions/checkout@v2
-      - run: make telegraf
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: telegraf
-          tag_name: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
-          draft: false
-          prerelease: false
+      - run: go version
