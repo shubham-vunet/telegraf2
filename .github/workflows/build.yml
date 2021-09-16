@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - "develop"
+      - "main"
   workflow_dispatch:
 env:
   RUN_NUMBER: ${{ github.run_number }}
+  TELEGRAF_VERSION: 1.20.0 # needs to be updated manually
 
 jobs:
   prebuild:
@@ -16,11 +18,19 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - run: make telegraf
-      - name: Create Release
-        uses: ncipollo/release-action@v1
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
         with:
-          tag: ${{ env.RUN_NUMBER }}
-          artifacts: "telegraf"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          name: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
+          files: telegraf
+          draft: false
+          prerelease: false
 
+      # - name: Create Release
+      #   uses: ncipollo/release-action@v1
+      #   with:
+      #     tag: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
+      #     artifacts: "telegraf"
+      #     token: ${{ secrets.GITHUB_TOKEN }}
 
