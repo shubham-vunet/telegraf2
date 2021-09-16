@@ -12,25 +12,16 @@ env:
 
 jobs:
   prebuild:
-    name: Prebuild and Testing
+    name: Build Telegraf
     runs-on: ubuntu-latest
     # if: github.repository_owner == 'vunetsystems'
     steps:
       - uses: actions/checkout@v2
       - run: make telegraf
-      - name: Release
+      - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          # name: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
-          tag_name: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
           files: telegraf
+          tag_name: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
           draft: false
           prerelease: false
-
-      # - name: Create Release
-      #   uses: ncipollo/release-action@v1
-      #   with:
-      #     tag: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
-      #     artifacts: "telegraf"
-      #     token: ${{ secrets.GITHUB_TOKEN }}
-
