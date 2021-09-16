@@ -1,0 +1,31 @@
+name: Build Apps
+
+on:
+  push:
+    branches:
+      - "develop"
+  workflow_dispatch:
+env:
+  RUN_NUMBER: ${{ github.run_number }}
+
+jobs:
+  prebuild:
+    name: Prebuild and Testing
+    runs-on: ubuntu-latest
+    # if: github.repository_owner == 'vunetsystems'
+    steps:
+      - uses: actions/checkout@v2
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v2
+        with:
+          version: v1.38
+          only-new-issues: true
+      - run: make telegraf
+      - name: Create Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.RUN_NUMBER }}
+          artifacts: "telegraf"
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+
