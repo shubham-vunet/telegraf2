@@ -21,7 +21,8 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
-          name: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
+          # name: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
+          tag_name: v${{ env.TELEGRAF_VERSION }}.${{ env.RUN_NUMBER }}
           files: telegraf
           draft: false
           prerelease: false
